@@ -1,10 +1,15 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
 
-import '../main.dart'; 
+import '../main.dart';
 import '../theme/app_theme.dart';
 import '../models/budget_models.dart';
+import 'profile_screen.dart';
+import '../services/database_helper.dart';
+import '../services/sync_service.dart';
 
 class BudgetHomeScreen extends StatefulWidget {
   const BudgetHomeScreen({super.key});
@@ -18,6 +23,9 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
   bool isLoading = true;
   bool isSelectionMode = false;
   Set<int> selectedIndices = {};
+
+  // ── Connectivity listener ──────────────────────────────────────────────────
+  late final StreamSubscription<List<ConnectivityResult>> _connectivitySub;
 
   final TextEditingController _itemController = TextEditingController();
   final TextEditingController _amountController = TextEditingController();
@@ -50,6 +58,85 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
   void initState() {
     super.initState();
     loadData();
+    // Startup sync: flush any pending rows that were queued while offline.
+    SyncService.attemptSync();
+    // Real-time connectivity listener.
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      _onConnectivityChanged,
+    );
+  }
+
+  @override
+  void dispose() {
+    _connectivitySub.cancel();
+    _itemController.dispose();
+    _amountController.dispose();
+    _qtyController.dispose();
+    _notesController.dispose();
+    _budgetController.dispose();
+    _categoryNameController.dispose();
+    super.dispose();
+  }
+
+  /// Handles network state changes and notifies the user via a SnackBar.
+  void _onConnectivityChanged(List<ConnectivityResult> results) {
+    final bool isOffline = results.every((r) => r == ConnectivityResult.none);
+
+    if (!mounted) return;
+
+    if (isOffline) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.cloud_off, color: Colors.white),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'You are offline. Data saved locally.',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: const Color(0xFFD32F2F),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+    } else {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.cloud_done, color: Colors.white),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Back online! Syncing to database...',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: const Color(0xFF2E7D32),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      // Flush any pending SQLite rows now that we have a connection.
+      SyncService.attemptSync();
+    }
   }
 
   Future<void> loadData() async {
@@ -77,6 +164,25 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
     final prefs = await SharedPreferences.getInstance();
     String dataString = jsonEncode(categories.map((c) => c.toJson()).toList());
     prefs.setString('budgetCategories_v2', dataString);
+  }
+
+  /// Persists a NEW transaction to SQLite (sync_status = 0) and immediately
+  /// fires an async sync attempt. Fire-and-forget — never awaited by the UI.
+  Future<void> _saveTransactionLocally({
+    required String budgetName,
+    required TransactionItem item,
+  }) async {
+    await DatabaseHelper.instance.insertTransaction({
+      'budget_id': budgetName,
+      'type': item.isIncome ? 'income' : 'expense',
+      'amount': item.amount,
+      'item_name': item.name,
+      'quantity': item.quantity,
+      'notes': item.notes,
+      'sync_status': 0,
+    });
+    // Attempt to push to server immediately — silently no-ops if offline.
+    SyncService.attemptSync();
   }
 
   Color getHealthColor() {
@@ -302,15 +408,37 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
                               qty = 1; 
                             }
 
+                            // Declare newItem OUTSIDE setState so it can be
+                            // referenced for the SQLite dual-write below.
+                            final TransactionItem newItem = TransactionItem(
+                              name: name,
+                              amount: amount!,
+                              quantity: qty,
+                              notes: _notesController.text.isEmpty ? null : _notesController.text,
+                              isIncome: isIncomeMode,
+                            );
+                            final String budgetName = activeCategory!.name;
+
                             setState(() {
-                              TransactionItem newItem = TransactionItem(name: name, amount: amount!, quantity: qty, notes: _notesController.text.isEmpty ? null : _notesController.text, isIncome: isIncomeMode);
                               if (isEditing) {
-                                activeCategory!.history[editIndex] = newItem; 
+                                activeCategory!.history[editIndex] = newItem;
                               } else {
                                 activeCategory!.history.insert(0, newItem);
                               }
                             });
-                            saveData(); Navigator.pop(context); 
+
+                            saveData();
+
+                            // Only new transactions get a SQLite record.
+                            // Edits update SharedPreferences only (Phase 4 scope).
+                            if (!isEditing) {
+                              _saveTransactionLocally(
+                                budgetName: budgetName,
+                                item: newItem,
+                              );
+                            }
+
+                            Navigator.pop(context);
                           },
                           child: const Text('Save Transaction', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                         ),
@@ -428,6 +556,36 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
               tooltip: isAllSelected ? 'Deselect All' : 'Select All',
               onPressed: toggleSelectAll,
             ),
+          if (!isSelectionMode)
+            IconButton(
+              icon: Icon(Icons.sync, color: textMain),
+              tooltip: 'Force Sync',
+              onPressed: () {
+                SyncService.attemptSync();
+                ScaffoldMessenger.of(context)
+                  ..hideCurrentSnackBar()
+                  ..showSnackBar(
+                    SnackBar(
+                      content: const Row(
+                        children: [
+                          Icon(Icons.sync, color: Colors.white),
+                          SizedBox(width: 10),
+                          Text(
+                            'Manual sync triggered...',
+                            style: TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                      backgroundColor: const Color(0xFF1565C0),
+                      behavior: SnackBarBehavior.floating,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+              },
+            ),
           IconButton(icon: Icon(isSelectionMode ? Icons.close : Icons.checklist_rtl, color: textMain), onPressed: toggleSelectionMode),
           if (!isSelectionMode)
             PopupMenuButton<String>(
@@ -439,6 +597,7 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
               ],
             )
         ] : null,
+
       ),
       drawer: _buildDrawer(),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
@@ -606,9 +765,17 @@ class _BudgetHomeScreenState extends State<BudgetHomeScreen> {
                   children: [
                     const Divider(height: 1),
                     ListTile(
-                      leading: Icon(Icons.add, color: isDark ? primaryBlue : textMain), 
-                      title: Text('Add New Budget', style: TextStyle(fontWeight: FontWeight.bold, color: textMain)), 
-                      onTap: () { Navigator.pop(context); _showAddOrEditCategoryDialog(); }
+                      leading: Icon(Icons.add, color: isDark ? primaryBlue : textMain),
+                      title: Text('Add New Budget', style: TextStyle(fontWeight: FontWeight.bold, color: textMain)),
+                      onTap: () { Navigator.pop(context); _showAddOrEditCategoryDialog(); },
+                    ),
+                    ListTile(
+                      leading: Icon(Icons.person_outline, color: isDark ? primaryBlue : textMain),
+                      title: Text('My Profile', style: TextStyle(fontWeight: FontWeight.bold, color: textMain)),
+                      onTap: () {
+                        Navigator.pop(context);
+                        Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen()));
+                      },
                     ),
                     SwitchListTile(
                       title: Text('Dark Mode', style: TextStyle(fontWeight: FontWeight.bold, color: textMain)),
